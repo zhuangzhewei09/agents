@@ -48,6 +48,7 @@ const (
 	SandboxStateResuming   SandboxState = "Resuming"
 	SandboxStateStopping   SandboxState = "Stopping"
 	SandboxStateTerminated SandboxState = "Terminated"
+	SandboxStateFailed     SandboxState = "Failed"
 )
 
 // Image identifies the container image a sandbox is created from. Phase 1
@@ -156,4 +157,60 @@ type CreateSandboxResponse struct {
 	// the sandbox creation timestamp (then to now) when the claim-time
 	// annotation is unreadable. See convertToOpenSandboxResponse.
 	CreatedAt string `json:"createdAt"`
+}
+
+// SandboxResponse is the response body for the sandbox-scoped read routes
+// (`GET /v1/sandboxes/{sandboxId}` and each item of `GET /v1/sandboxes`). It
+// mirrors the OpenSandbox `Sandbox` schema, whose required keys are `id`,
+// `status`, `createdAt`, and `entrypoint`; those are always serialized (never
+// omitempty) so the generated SDKs can pop them unconditionally.
+//
+// Compatibility limits (Phase 2):
+//   - `entrypoint` is always an empty list: the create path echoes the request
+//     entrypoint but does not persist it, so it cannot be recovered on read.
+//   - `image`, `snapshotId`, `platform`, `extensions`, and `allocation` are
+//     omitted: agents sandboxes are template-backed, and the OpenSandbox
+//     startup-source model has no agents counterpart yet (tracked by the
+//     virtual-template direction in issue #690).
+type SandboxResponse struct {
+	ID         string            `json:"id"`
+	Status     SandboxStatus     `json:"status"`
+	Entrypoint []string          `json:"entrypoint"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+	ExpiresAt  string            `json:"expiresAt,omitempty"`
+	CreatedAt  string            `json:"createdAt"`
+}
+
+// PaginationInfo mirrors the OpenSandbox `PaginationInfo` schema. Every field
+// is required, so the struct is always fully populated (no omitempty).
+type PaginationInfo struct {
+	Page        int  `json:"page"`
+	PageSize    int  `json:"pageSize"`
+	TotalItems  int  `json:"totalItems"`
+	TotalPages  int  `json:"totalPages"`
+	HasNextPage bool `json:"hasNextPage"`
+}
+
+// ListSandboxesResponse is the response body for `GET /v1/sandboxes`. It
+// mirrors the OpenSandbox `ListSandboxesResponse` schema: both `items` and
+// `pagination` are required. `Items` is always non-nil so it serializes as
+// `[]` rather than `null` for an empty result set.
+type ListSandboxesResponse struct {
+	Items      []SandboxResponse `json:"items"`
+	Pagination PaginationInfo    `json:"pagination"`
+}
+
+// RenewSandboxExpirationRequest is the request body for
+// `POST /v1/sandboxes/{sandboxId}/renew-expiration`. It mirrors the OpenSandbox
+// `RenewSandboxExpirationRequest` schema: `expiresAt` is a required RFC3339
+// timestamp that must be in the future and after the current expiration.
+type RenewSandboxExpirationRequest struct {
+	ExpiresAt string `json:"expiresAt"`
+}
+
+// RenewSandboxExpirationResponse is the response body for the renew route. It
+// mirrors the OpenSandbox `RenewSandboxExpirationResponse` schema, whose only
+// required field is the updated `expiresAt`.
+type RenewSandboxExpirationResponse struct {
+	ExpiresAt string `json:"expiresAt"`
 }
