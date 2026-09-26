@@ -56,17 +56,14 @@ func TestRegisterRoutes(t *testing.T) {
 	})
 }
 
-// TestRegisterRoutesRouting exercises each registered pattern through the mux and
-// asserts it resolves to a handler rather than the mux's built-in 404. A
-// zero-value manager has no infra, so handler/middleware calls either return a
-// classified error or panic; web.RegisterRoute recovers panics into a 500. Either
-// way the status is not the mux's 404, which is exactly what proves the pattern
-// matched and the chain ran.
+// TestRegisterRoutesRouting checks that every registered route runs API-key
+// authentication and uses the same OpenSandbox error body before Manager access.
 func TestRegisterRoutesRouting(t *testing.T) {
 	mux := http.NewServeMux()
 	require.NoError(t, RegisterRoutes(Deps{
 		Mux:     mux,
 		Manager: &sandboxmanager.SandboxManager{},
+		Keys:    &fakeKeyStorage{},
 	}))
 
 	tests := []struct {
@@ -89,8 +86,9 @@ func TestRegisterRoutesRouting(t *testing.T) {
 			r, err := http.NewRequest(tt.method, tt.target, http.NoBody)
 			require.NoError(t, err)
 			mux.ServeHTTP(w, r)
-			assert.NotEqual(t, http.StatusNotFound, w.Code,
-				"route %s %s did not resolve to a handler", tt.method, tt.target)
+			assert.Equal(t, http.StatusUnauthorized, w.Code,
+				"route %s %s must run authentication", tt.method, tt.target)
+			assert.Contains(t, w.Body.String(), `"code":"UNAUTHORIZED"`)
 		})
 	}
 }

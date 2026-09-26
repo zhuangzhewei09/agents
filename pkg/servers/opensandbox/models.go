@@ -14,12 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package opensandbox implements the OpenSandbox-compatible API layer for
-// sandbox-manager. It exposes the OpenSandbox lifecycle REST contract
-// (baseline: OpenSandbox server/v0.2.3) alongside the native E2B API, sharing
-// the same SandboxManager instance and API-key storage. Phase 1 covers the
-// create path only; later phases add describe/list/pause/resume/delete,
-// endpoints, and metadata patch.
+// Package opensandbox implements the OpenSandbox API adapter alongside the
+// native E2B API, sharing SandboxManager and API-key storage. Create and the
+// existing list/describe/delete/pause/resume/renew routes are consolidated here.
+// Full create compatibility and endpoint integration remain in progress; the
+// proposal records the fixed contract baseline and remaining execution gaps.
 //
 // Layering: this package sits in the API layer (pkg/servers/**). It depends on
 // pkg/sandbox-manager (Manager) and pkg/servers/e2b/{keys,models} (shared auth
@@ -34,10 +33,7 @@ import "encoding/json"
 // used by the E2B `X-API-Key` header (issue #690: "reuse keys.KeyStorage").
 const HeaderOpenSandboxAPIKey = "OPEN-SANDBOX-API-KEY" // #nosec G101 -- header name, not a credential
 
-// SandboxState enumerates the OpenSandbox lifecycle states. Phase 1 only
-// emits StateRunning from the create path; the remaining constants are
-// declared here so later phases (describe/list/pause/resume) reuse the same
-// vocabulary instead of introducing string literals at each call site.
+// SandboxState is the shared lifecycle vocabulary for create and read responses.
 type SandboxState string
 
 const (
@@ -57,11 +53,10 @@ const (
 // or reuse of a SandboxSet) is tracked in issue #690.
 type Image struct {
 	URI string `json:"uri"`
-	// Platform is parsed but not propagated in Phase 1 (compatibility limit).
-	Platform *Platform `json:"platform,omitempty"`
 }
 
-// Platform mirrors the OpenSandbox `platform` field. Phase 1 parses it for
+// Platform mirrors the OpenSandbox top-level `platform` (PlatformSpec) field,
+// which the spec defines as independent from `image`. Phase 1 parses it for
 // forward compatibility but does not propagate it to the backend.
 type Platform struct {
 	OS   string `json:"os,omitempty"`
@@ -107,11 +102,15 @@ type CreateSandboxRequest struct {
 	// It is echoed back in the create response because the OpenSandbox
 	// response schema marks it required ("copied from the creation request").
 	Entrypoint []string `json:"entrypoint,omitempty"`
-	// Timeout is the sandbox lifetime in seconds. When omitted the backend
-	// default applies. Bounded by Deps.MaxTimeout.
-	Timeout int `json:"timeout,omitempty"`
-	// EnvVars are injected into the sandbox runtime via InitRuntime.
-	EnvVars map[string]string `json:"envVars,omitempty"`
+	// Platform is the top-level platform constraint (PlatformSpec), parsed but
+	// not propagated in Phase 1.
+	Platform *Platform `json:"platform,omitempty"`
+	// Timeout is the sandbox lifetime in seconds. Omitted/null disables
+	// automatic expiration; a supplied value must be at least 60 seconds.
+	Timeout *int64 `json:"timeout,omitempty"`
+	// Env are environment variables injected into the sandbox runtime via
+	// InitRuntime. The wire name is `env` per the OpenSandbox schema.
+	Env map[string]string `json:"env,omitempty"`
 	// Metadata is persisted as sandbox annotations and echoed back in the
 	// response. Keys must be qualified Kubernetes annotation keys.
 	Metadata map[string]string `json:"metadata,omitempty"`

@@ -18,7 +18,6 @@ package opensandbox
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"time"
 
@@ -74,12 +73,8 @@ const sandboxLoadTimeout = 2 * time.Second
 //     canonical anonymous caller with admin privileges.
 //   - An invalid or missing key returns 401.
 //
-// The sandbox-scoped owner anti-enumeration check (an ownership mismatch
-// returns the same 404 as a missing route, so authenticated callers cannot
-// probe which sandbox IDs exist) is deliberately not implemented here: Phase 1
-// registers only create, which carries no sandboxID path value, so the check
-// would be unreachable. It lands together with the first sandbox-scoped route
-// so it is exercised against a real route.
+// Sandbox-scoped routes additionally use loadOwnedSandbox to check ownership.
+// Missing and foreign sandboxes share the same public 404 status and body.
 //
 // The resolved user is stashed in the request context under userContextKey
 // and retrieved by GetUserFromContext.
@@ -151,7 +146,8 @@ func NamespaceOfUser(user *models.CreatedTeamAPIKey) string {
 // to the same 404, so an authenticated caller cannot probe which sandbox IDs
 // exist or who owns them. Only an inconclusive infra failure (ErrorInternal)
 // surfaces as 500. expectedStates is per-route (describe/delete accept the
-// claimed set; resume/renew accept only the live set) and is forwarded to
+// claimed set for describe; delete accepts any owned state; resume/renew accept
+// only the live set) and is forwarded to
 // Manager.GetSandbox, which enforces both ownership and state.
 //
 // The OpenSandbox DELETE spec admits 404 for a missing sandbox (unlike the E2B
@@ -179,10 +175,12 @@ func (s *Server) loadOwnedSandbox(expectedStates []string) web.MiddleWare {
 		})
 		if err != nil {
 			log.Error(err, "failed to load sandbox", "sandboxID", sandboxID)
-			return ctx, &web.ApiError{
-				Code:    getSandboxErrorCode(err),
-				Message: fmt.Sprintf("Cannot get sandbox %s: %v", sandboxID, err),
+			code := getSandboxErrorCode(err)
+			message := "sandbox not found"
+			if code == http.StatusInternalServerError {
+				message = "failed to load sandbox"
 			}
+			return ctx, &web.ApiError{Code: code, Message: message}
 		}
 		return context.WithValue(ctx, sandboxContextKey, sbx), nil
 	}

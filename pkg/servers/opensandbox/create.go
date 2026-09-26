@@ -19,30 +19,32 @@ package opensandbox
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 
+	agentsv1alpha1 "github.com/openkruise/agents/api/v1alpha1"
 	sandboxmanager "github.com/openkruise/agents/pkg/sandbox-manager"
 	"github.com/openkruise/agents/pkg/sandbox-manager/config"
 	managererrors "github.com/openkruise/agents/pkg/sandbox-manager/errors"
 	"github.com/openkruise/agents/pkg/sandbox-manager/infra"
 	"github.com/openkruise/agents/pkg/servers/web"
+	annotationutils "github.com/openkruise/agents/pkg/utils/annotations"
 	"github.com/openkruise/agents/pkg/utils/timeout"
 )
 
-// defaultTimeoutSeconds applies when the request omits `timeout`. It mirrors
-// the E2B layer's models.DefaultTimeoutSeconds so both protocols share the
-// same operator-visible default; the value is intentionally not configurable
-// per-protocol to avoid a second tuning knob for the same backend behavior.
-const defaultTimeoutSeconds = 300
+// minTimeoutSeconds is the OpenSandbox contract's lower bound. Sandbox
+// lifetime is independent of E2B defaults and of the claim/ready wait budget.
+const minTimeoutSeconds = 60
 
-// minTimeoutSeconds floors the accepted `timeout` value. It mirrors the E2B
-// layer's models.DefaultMinTimeoutSeconds for the same reason as the default.
-const minTimeoutSeconds = 30
+// A Go duration represents nanoseconds; validate before converting seconds.
+const maxTimeoutSeconds = int64((1<<63 - 1) / int64(time.Second))
 
 // noServerTimeout bounds the claim/wait-ready phases when the operator has not
 // configured a tighter deadline. It is a far-future duration rather than a
@@ -55,16 +57,10 @@ const noServerTimeout = 100 * 365 * 24 * time.Hour
 // create request into an agents claim, delegates to SandboxManager, and
 // translates the claimed sandbox back into the OpenSandbox response shape.
 //
-// Phase 1 scope:
-//   - Startup source: `image.uri` only, resolved to a SandboxTemplate via the
-//     static alias table. `snapshotId` is rejected with 400.
-//   - Propagated fields: `timeout`, `envVars`, `metadata`.
-//   - Echoed fields: `entrypoint` is not propagated to the sandbox spec but
-//     is echoed in the response, which the OpenSandbox response schema
-//     requires ("copied from the creation request").
-//   - Ignored fields (parsed but not propagated, declared as compatibility
-//     limits in the proposal): `resourceLimits`, `networkPolicy`,
-//     `secureAccess`, `lifecycle`, `platform`.
+// The current image path resolves a preconfigured template and applies timeout,
+// env and metadata. Other parsed fields are not yet applied; returning them in
+// a response is not evidence of execution compatibility. Source resolution and
+// startup configuration remain part of the create compatibility work.
 //
 // The handler deliberately does not reuse the E2B CreateSandbox code path:
 // the two protocols have different request/response shapes, different status
@@ -92,24 +88,30 @@ func (s *Server) CreateSandbox(r *http.Request) (web.ApiResponse[CreateSandboxRe
 
 	templateID, mapErr := ResolveTemplateID(s.imageAliases, request.Image.URI)
 	if mapErr != nil {
+		// Static aliases are a transitional deployment configuration. Automatic
+		// virtual-template preparation remains part of create compatibility.
 		return web.ApiResponse[CreateSandboxResponse]{}, &web.ApiError{
-			Code:    http.StatusBadRequest,
+			Code:    http.StatusInternalServerError,
 			Message: mapErr.Error(),
 		}
 	}
 
 	namespace := NamespaceOfUser(user)
 	log.Info("opensandbox create request received",
-		"imageURI", request.Image.URI, "templateID", templateID, "namespace", namespace, "timeout", request.Timeout)
+		"imageURI", request.Image.URI, "templateID", templateID, "namespace", namespace)
 
 	accessToken := config.NewDefaultAccessToken()
 	infraOpts := infra.ClaimSandboxOptions{
+		CreateOnNoStock: true,
+		UserMetadataKeys: &agentsv1alpha1.UpdatedMetadataInClaim{
+			Annotations: slices.Sorted(maps.Keys(request.Metadata)),
+		},
 		Namespace:    namespace,
 		Template:     templateID,
 		User:         user.ID.String(),
 		ClaimTimeout: noServerTimeout,
 		InitRuntime: &config.InitRuntimeOptions{
-			EnvVars:     request.EnvVars,
+			EnvVars:     request.Env,
 			AccessToken: accessToken,
 		},
 		Modifier: func(sbx infra.Sandbox) error {
@@ -150,14 +152,19 @@ func parseCreateSandboxRequest(r *http.Request, maxTimeout int) (CreateSandboxRe
 		}
 	}
 
-	// Phase 1 supports image-based creation only. Snapshot restore is a
-	// separate code path (CloneSandbox) that belongs to a later PR; rejecting
-	// it explicitly here keeps the contract honest instead of silently
-	// ignoring the field.
+	// A request must contain exactly one JSON document. Decode alone would
+	// accept a valid request followed by another value or malformed suffix.
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return request, &web.ApiError{Code: http.StatusBadRequest, Message: "request body must contain exactly one JSON object"}
+	}
+
+	// Snapshot restore still needs source validation and startup overrides.
+	// This guard is an implementation gap, not a compatible restore path.
 	if request.SnapshotID != "" {
 		return request, &web.ApiError{
 			Code:    http.StatusBadRequest,
-			Message: "snapshotId restore is not supported in Phase 1; use image.uri",
+			Message: "snapshotId restore is not implemented; use image.uri",
 		}
 	}
 	if request.Image == nil || strings.TrimSpace(request.Image.URI) == "" {
@@ -167,24 +174,34 @@ func parseCreateSandboxRequest(r *http.Request, maxTimeout int) (CreateSandboxRe
 		}
 	}
 
-	// Timeout bounds mirror the E2B layer so both protocols share the same
-	// operator-visible ceiling. An omitted timeout falls back to the shared
-	// default rather than the backend's own default, so the two surfaces
-	// behave identically for the same request.
-	if request.Timeout == 0 {
-		request.Timeout = defaultTimeoutSeconds
+	if len(request.Entrypoint) == 0 {
+		return request, &web.ApiError{Code: http.StatusBadRequest, Message: "entrypoint is required for image creation and must not be empty"}
 	}
-	if request.Timeout < minTimeoutSeconds || (maxTimeout > 0 && request.Timeout > maxTimeout) {
-		return request, &web.ApiError{
-			Code: http.StatusBadRequest,
-			Message: fmt.Sprintf("timeout must be between %d and %d seconds",
-				minTimeoutSeconds, maxTimeout),
+	if request.ResourceLimits == nil {
+		return request, &web.ApiError{Code: http.StatusBadRequest, Message: "resourceLimits is required for image creation"}
+	}
+	if request.Platform != nil && (strings.TrimSpace(request.Platform.OS) == "" || strings.TrimSpace(request.Platform.Arch) == "") {
+		return request, &web.ApiError{Code: http.StatusBadRequest, Message: "platform.os and platform.arch are required when platform is provided"}
+	}
+	if request.Timeout != nil {
+		seconds := *request.Timeout
+		if seconds < minTimeoutSeconds {
+			return request, &web.ApiError{Code: http.StatusBadRequest, Message: "timeout must be at least 60 seconds"}
+		}
+		if (maxTimeout > 0 && seconds > int64(maxTimeout)) || seconds > maxTimeoutSeconds {
+			return request, &web.ApiError{Code: http.StatusBadRequest, Message: "timeout exceeds the server maximum"}
 		}
 	}
 
 	// Metadata keys become Kubernetes annotation keys, so they must satisfy
-	// the qualified-name rule. Rejecting at parse time keeps the manager call
-	// from failing on a CRD validation error that would surface as 500.
+	// the qualified-name rule and must not collide with internally reserved
+	// prefixes. Rejecting at parse time keeps the manager call from failing on
+	// a CRD validation error that would surface as 500, and prevents tenants
+	// from injecting internal annotations (e.g. claim/pool state) through
+	// user metadata. The blacklist check mirrors the E2B layer's
+	// ValidateMetadataKey; it is applied via the shared annotations package
+	// rather than imported from pkg/servers/e2b to keep the two API surfaces
+	// independent.
 	for k := range request.Metadata {
 		if errLists := validation.IsQualifiedName(k); len(errLists) > 0 {
 			return request, &web.ApiError{
@@ -193,28 +210,28 @@ func parseCreateSandboxRequest(r *http.Request, maxTimeout int) (CreateSandboxRe
 					k, strings.Join(errLists, ", ")),
 			}
 		}
+		if annotationutils.IsBlackListed(k) {
+			return request, &web.ApiError{
+				Code: http.StatusBadRequest,
+				Message: fmt.Sprintf("Forbidden metadata key [%s]: cannot contain prefixes: %v",
+					k, annotationutils.BlackListPrefix),
+			}
+		}
 	}
 
 	return request, nil
 }
 
-// applyCreateModifier writes the request-scoped sandbox shape (lifetime,
-// user metadata) onto the claimed sandbox before it is persisted. It is the
-// Phase 1 counterpart of the E2B layer's basicSandboxCreateModifier, trimmed
-// to the fields OpenSandbox actually propagates.
-//
-// Deliberately omitted (Phase 1 compatibility limits, declared in the
-// proposal): auto-pause/wake, paused-retention, security rules, CSI mounts,
-// network policy, inplace-update, return-pod-IP. Adding any of these here
-// without a corresponding proposal update would silently expand the contract.
+// applyCreateModifier writes the lifetime and metadata onto the claimed sandbox
+// before persistence. Other startup fields need separate execution support.
 func applyCreateModifier(sbx infra.Sandbox, request CreateSandboxRequest) {
-	// Lifetime: OpenSandbox `timeout` is the sandbox's absolute lifetime, so
-	// it maps to ShutdownTime. PauseTime stays unset — auto-pause is an E2B
-	// concept with no OpenSandbox counterpart in Phase 1.
-	now := time.Now()
-	sbx.SetTimeout(timeout.Options{
-		ShutdownTime: timeout.NormalizeTime(now.Add(time.Duration(request.Timeout) * time.Second)),
-	})
+	// SetTimeout replaces both deadlines. An omitted/null timeout must also
+	// clear any pause/shutdown deadline inherited from pooled stock.
+	opts := timeout.Options{}
+	if request.Timeout != nil {
+		opts.ShutdownTime = timeout.NormalizeTime(time.Now().Add(time.Duration(*request.Timeout) * time.Second))
+	}
+	sbx.SetTimeout(opts)
 
 	if len(request.Metadata) == 0 {
 		return
@@ -283,7 +300,7 @@ func convertToOpenSandboxResponse(sbx infra.Sandbox, request CreateSandboxReques
 		response.ExpiresAt = expiresAt.Format(time.RFC3339)
 	}
 	if len(request.Metadata) > 0 {
-		response.Metadata = request.Metadata
+		response.Metadata = maps.Clone(request.Metadata)
 	}
 	// Resource context is written last so persisted user metadata cannot
 	// spoof it. This mirrors the E2B layer's MetadataKeySandboxResource

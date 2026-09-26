@@ -153,7 +153,6 @@ func main() {
 	var trafficTokenMaxValidity time.Duration
 	var secretConfigRef string
 	var enableOpenSandboxCompat bool
-	var openSandboxImageAliases []string
 
 	utilfeature.DefaultMutableFeatureGate.AddFlag(pflag.CommandLine)
 
@@ -223,11 +222,9 @@ func main() {
 	// enabled it shares the E2B listener, key store, and SandboxManager.
 	pflag.BoolVar(&enableOpenSandboxCompat, "enable-opensandbox-compat", false,
 		"Enable the OpenSandbox-compatible API surface (POST /v1/sandboxes) alongside the native E2B API. "+
-			"The compat surface reuses the E2B listener, API-key storage, and SandboxManager instance.")
-	pflag.StringSliceVar(&openSandboxImageAliases, "opensandbox-image-alias", nil,
-		"OpenSandbox image URI to agents SandboxTemplate mapping, in the form image_uri=template_id. "+
-			"Repeatable or comma-separated. Required for every image the OpenSandbox create path should accept; "+
-			"an unmapped image.uri is rejected with 400. Read once at startup, no dynamic refresh.")
+			"The compat surface reuses the E2B listener, API-key storage, and SandboxManager instance. "+
+			"The image-to-template alias table is supplied through the "+opensandbox.EnvImageAliases+" "+
+			"environment variable (typically injected from a ConfigMap via envFrom), not a flag.")
 
 	// Tracing flags (definitions shared with agent-sandbox-controller via
 	// tracing.Config.BindFlags; pulled into pflag by AddGoFlagSet below)
@@ -451,9 +448,10 @@ func main() {
 	// surface is additive: with the flag off, the mux is byte-identical to the
 	// E2B-only registration.
 	if enableOpenSandboxCompat {
-		imageAliases, err := opensandbox.ParseImageAliases(openSandboxImageAliases)
+		imageAliases, err := opensandbox.ParseImageAliases(
+			opensandbox.SplitImageAliasesEnv(os.Getenv(opensandbox.EnvImageAliases)))
 		if err != nil {
-			klog.Fatalf("invalid --opensandbox-image-alias: %v", err)
+			klog.Fatalf("invalid %s: %v", opensandbox.EnvImageAliases, err)
 		}
 		if err := opensandbox.RegisterRoutes(opensandbox.Deps{
 			Mux:          sandboxController.Mux(),

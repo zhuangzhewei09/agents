@@ -111,10 +111,10 @@ func TestMapState(t *testing.T) {
 			want:        SandboxStateRunning,
 		},
 		{
-			name:        "claimed but not ready is surfaced as Running",
+			name:        "claimed but not ready remains Pending",
 			agentsState: agentsv1alpha1.SandboxStateDead,
 			reason:      "RunningResourceClaimedButNotReady",
-			want:        SandboxStateRunning,
+			want:        SandboxStatePending,
 		},
 		{
 			name:        "paused maps to Paused",
@@ -135,10 +135,10 @@ func TestMapState(t *testing.T) {
 			want:        SandboxStateTerminated,
 		},
 		{
-			name:        "unknown state falls back to Running",
+			name:        "unknown state remains Pending",
 			agentsState: "some-future-state",
 			reason:      "Whatever",
-			want:        SandboxStateRunning,
+			want:        SandboxStatePending,
 		},
 	}
 
@@ -232,6 +232,39 @@ func TestParseImageAliases(t *testing.T) {
 	}
 }
 
+func TestSplitImageAliasesEnv(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  []string
+	}{
+		{name: "empty value yields no entries", value: "", want: nil},
+		{name: "blank value yields no entries", value: "   ", want: nil},
+		{name: "single entry", value: "python:3.11=python-tpl", want: []string{"python:3.11=python-tpl"}},
+		{
+			name:  "comma separated entries are trimmed",
+			value: " python:3.11=python-tpl , nginx:1.27=web-tpl ",
+			want:  []string{"python:3.11=python-tpl", "nginx:1.27=web-tpl"},
+		},
+		{
+			name:  "empty items are dropped",
+			value: "python:3.11=python-tpl,, ,nginx:1.27=web-tpl,",
+			want:  []string{"python:3.11=python-tpl", "nginx:1.27=web-tpl"},
+		},
+		{
+			name:  "malformed entries pass through for ParseImageAliases",
+			value: "bad-entry,python:3.11=python-tpl",
+			want:  []string{"bad-entry", "python:3.11=python-tpl"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, SplitImageAliasesEnv(tt.value))
+		})
+	}
+}
+
 // TestMapStateReasonPhase exhaustively covers the agents (state, reason, phase)
 // combinations produced by utils.GetSandboxState and asserts each maps to the
 // intended OpenSandbox lifecycle state. The final cases assert an unmapped
@@ -254,7 +287,7 @@ func TestMapStateReasonPhase(t *testing.T) {
 		{name: "resuming phase is Resuming", state: agentsv1alpha1.SandboxStatePaused, reason: reasonNotRunningClaimed, phase: string(agentsv1alpha1.SandboxResuming), want: SandboxStateResuming},
 		{name: "recycling phase is Stopping", state: agentsv1alpha1.SandboxStatePaused, reason: reasonNotRunningClaimed, phase: string(agentsv1alpha1.SandboxRecycling), want: SandboxStateStopping},
 		{name: "upgrading phase is Running", state: agentsv1alpha1.SandboxStatePaused, reason: reasonNotRunningClaimed, phase: string(agentsv1alpha1.SandboxUpgrading), want: SandboxStateRunning},
-		{name: "claimed but not ready is Running", state: agentsv1alpha1.SandboxStateDead, reason: reasonRunningClaimedButNotReady, phase: string(agentsv1alpha1.SandboxRunning), want: SandboxStateRunning},
+		{name: "claimed but not ready is Pending", state: agentsv1alpha1.SandboxStateDead, reason: reasonRunningClaimedButNotReady, phase: string(agentsv1alpha1.SandboxRunning), want: SandboxStatePending},
 		{name: "terminating is Stopping", state: agentsv1alpha1.SandboxStateDead, reason: reasonResourceTerminating, phase: string(agentsv1alpha1.SandboxTerminating), want: SandboxStateStopping},
 		{name: "failed is Failed", state: agentsv1alpha1.SandboxStateDead, reason: reasonResourceFailed, phase: string(agentsv1alpha1.SandboxFailed), want: SandboxStateFailed},
 		{name: "deleted is Terminated", state: agentsv1alpha1.SandboxStateDead, reason: reasonResourceDeleted, phase: string(agentsv1alpha1.SandboxTerminating), want: SandboxStateTerminated},

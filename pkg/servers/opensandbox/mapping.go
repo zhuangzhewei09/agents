@@ -31,25 +31,22 @@ import (
 	"github.com/openkruise/agents/pkg/servers/web"
 )
 
-// ErrImageNotMapped is returned by ResolveTemplateID when the requested image
-// URI has no entry in the static alias table. Phase 1 deliberately has no
-// fallback: an unmapped image is a configuration gap, not a runtime condition,
-// and the caller surfaces it as 400 so the operator sees the missing alias
-// immediately. The formal "virtual template" direction (per-image auto-create
-// or reuse of a SandboxSet) is tracked in issue #690 and belongs to a later PR.
+// ErrImageNotMapped reports a missing transitional image alias. Automatic
+// virtual-template preparation is still required for image create compatibility.
 type ErrImageNotMapped struct {
 	ImageURI string
 }
 
 func (e *ErrImageNotMapped) Error() string {
-	return fmt.Sprintf("image %q is not mapped to any SandboxTemplate; add --opensandbox-image-alias %s=<template-id>", e.ImageURI, e.ImageURI)
+	return fmt.Sprintf("image %q is not mapped to any SandboxTemplate; add %s=<template-id> to the %s environment variable", e.ImageURI, e.ImageURI, EnvImageAliases)
 }
 
 // ResolveTemplateID looks up the agents SandboxTemplate name that backs the
 // given OpenSandbox image URI. The alias table is injected at startup
-// (--opensandbox-image-alias) and is read-only at request time. Lookup is
+// (the OPENSANDBOX_IMAGE_ALIASES environment variable) and is read-only at
+// request time. Lookup is
 // exact-string: no normalization, no registry/tag inference. A miss returns an
-// error wrapping *ErrImageNotMapped so the caller can classify it as 400 with
+// error wrapping *ErrImageNotMapped so the caller can classify it as 500 with
 // errors.As instead of matching on the message.
 //
 // The error is returned as the interface type (not the concrete pointer) so a
@@ -69,19 +66,13 @@ func ResolveTemplateID(aliases map[string]string, imageURI string) (string, erro
 // MapState translates an agents sandbox state (plus the reason string that
 // accompanies the "dead" state) into the OpenSandbox lifecycle vocabulary.
 //
-// The mapping mirrors the convention established by the E2B layer's
-// convertToE2BSandbox: a sandbox in the Running phase that is claimed but not
-// yet ready is reported as "dead" by GetState because the Ready condition is
-// unsatisfied, but the underlying phase is Running, so both protocols surface
-// it as running/Running to avoid returning an unparsable terminal state to
-// SDK clients while the sandbox is still live.
-//
-// Phase 1 only emits StateRunning from the create path; the remaining branches
-// are declared so later phases (describe/list/pause/resume) reuse the same
-// translation instead of re-deriving it at each call site.
+// A claimed instance that is not ready remains Pending. Native E2B state
+// conventions must not turn a missing readiness observation into Running on
+// the OpenSandbox API. Unknown backend states also remain Pending, retaining
+// the reason for diagnosis until a recognized observation arrives.
 func MapState(agentsState, reason string) SandboxState {
 	if agentsState == agentsv1alpha1.SandboxStateDead && reason == "RunningResourceClaimedButNotReady" {
-		return SandboxStateRunning
+		return SandboxStatePending
 	}
 	switch agentsState {
 	case agentsv1alpha1.SandboxStateRunning:
@@ -93,12 +84,32 @@ func MapState(agentsState, reason string) SandboxState {
 	case agentsv1alpha1.SandboxStateDead:
 		return SandboxStateTerminated
 	default:
-		// Unknown states fall back to Running so a new agents-side state does
-		// not silently become a terminal state on the OpenSandbox surface.
-		// The reason string is preserved in SandboxStatus.Reason for
-		// diagnosis.
-		return SandboxStateRunning
+		return SandboxStatePending
 	}
+}
+
+// EnvImageAliases is the environment variable carrying the comma-separated
+// image alias table ("image_uri=template_id,..."). It is typically injected
+// from a ConfigMap via envFrom and is read once at startup; there is no
+// dynamic refresh, so changing it requires a pod restart.
+const EnvImageAliases = "OPENSANDBOX_IMAGE_ALIASES"
+
+// SplitImageAliasesEnv splits an EnvImageAliases value into individual
+// "image_uri=template_id" entries. Entries are trimmed and empty items are
+// dropped so a trailing comma or a formatted multi-line ConfigMap value stays
+// parsable; malformed entries are left for ParseImageAliases to reject.
+func SplitImageAliasesEnv(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	entries := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			entries = append(entries, part)
+		}
+	}
+	return entries
 }
 
 // Reason strings reported by utils.GetSandboxState alongside SandboxState*.
@@ -130,8 +141,8 @@ const (
 //     is a pause that has been accepted but not completed → Pausing.
 //   - Phase==Resuming (reason NotRunningClaimed) → Resuming; Phase==Paused →
 //     Paused; Phase==Recycling → Stopping; Phase==Upgrading → Running.
-//   - dead + RunningResourceClaimedButNotReady keeps the Phase 1 convention
-//     (claimed but not yet ready is surfaced as Running, not terminal).
+//   - dead + RunningResourceClaimedButNotReady remains Pending, consistent
+//     with the create response until readiness is observed.
 //   - dead + ResourceTerminating → Stopping; ResourceFailed → Failed;
 //     ResourceDeleted / ResourceSucceeded / ShutdownTimeReached → Terminated.
 //
@@ -178,7 +189,7 @@ func mapStateReasonPhase(state, reason, phase string) (SandboxState, error) {
 	case agentsv1alpha1.SandboxStateDead:
 		switch reason {
 		case reasonRunningClaimedButNotReady:
-			return SandboxStateRunning, nil
+			return SandboxStatePending, nil
 		case reasonResourceTerminating:
 			return SandboxStateStopping, nil
 		case reasonResourceFailed:
@@ -230,7 +241,7 @@ func mapLifecycleErrorToApiError(err error) *web.ApiError {
 	}
 }
 
-// ParseImageAlias parses a single --opensandbox-image-alias entry of the form
+// ParseImageAlias parses a single alias entry of the form
 // "image_uri=template_id". It returns an error when the entry is malformed so
 // startup fails loudly instead of registering a half-parsed alias.
 func ParseImageAlias(entry string) (imageURI, templateID string, err error) {
@@ -246,7 +257,7 @@ func ParseImageAlias(entry string) (imageURI, templateID string, err error) {
 	return imageURI, templateID, nil
 }
 
-// ParseImageAliases parses a list of --opensandbox-image-alias entries into a
+// ParseImageAliases parses a list of alias entries (see SplitImageAliasesEnv) into a
 // read-only map. Duplicate image URIs are rejected: an operator typo that
 // silently overwrites an earlier alias is worse than a startup failure.
 func ParseImageAliases(entries []string) (map[string]string, error) {

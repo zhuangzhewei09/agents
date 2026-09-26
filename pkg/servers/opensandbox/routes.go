@@ -41,10 +41,10 @@ const pathValueSandboxID = "sandboxId"
 // the E2B layer's claimedSandboxStates / liveSandboxStates so both protocols
 // accept the same sandbox states on equivalent routes:
 //   - claimedSandboxStates includes dead so a transitional or recently-dead
-//     sandbox can still be inspected (describe) or cleaned up (delete); the
+//     sandbox can still be inspected (describe); the
 //     read handlers apply isSandboxViewable to hide genuinely gone sandboxes.
 //   - liveSandboxStates excludes dead for operations that need a live sandbox
-//     (resume, renew-expiration).
+//     (resume, renew-expiration). Delete accepts any owned state for cleanup.
 var (
 	claimedSandboxStates = []string{
 		agentsv1alpha1.SandboxStateRunning,
@@ -80,10 +80,11 @@ type Deps struct {
 	// layer's behavior when --e2b-enable-auth=false.
 	Keys keys.KeyStorage
 	// ImageAliases maps OpenSandbox image URIs to agents SandboxTemplate
-	// names. It is injected at startup (--opensandbox-image-alias) and is
+	// names. It is injected at startup via the OPENSANDBOX_IMAGE_ALIASES
+	// environment variable (typically a ConfigMap via envFrom) and is
 	// read-only at request time. An empty or nil table makes every create
-	// request fail with 400, which is the intended Phase 1 behavior: the
-	// operator must explicitly declare which images are supported.
+	// request fail with 500. This is a transitional configuration requirement;
+	// automatic virtual-template preparation remains implementation work.
 	ImageAliases map[string]string
 	// MaxTimeout bounds the accepted `timeout` field in seconds. It mirrors
 	// the E2B --e2b-max-timeout flag so both protocols share the same
@@ -108,13 +109,9 @@ type Server struct {
 // deps.Mux. It returns an error when deps is missing a required field so the
 // entrypoint fails loudly at startup instead of serving a half-wired route.
 //
-// Phase 1 registered only create; Phase 2 adds the sandbox-scoped lifecycle
-// routes (list/describe/delete/pause/resume/renew-expiration). Every sandbox-
-// scoped route chains CheckApiKey → loadOwnedSandbox so the owner anti-
-// enumeration check is exercised against a real route, as the Phase 1 auth
-// comment promised. Later phases add endpoints/connect and metadata patch;
-// each addition must be accompanied by a proposal update (see
-// docs/proposals/20260918-opensandbox-compat.md).
+// The route table includes create and the consolidated lifecycle handlers.
+// Every sandbox-scoped route authenticates and loads an owned sandbox before
+// the handler runs. Further endpoint integration is tracked in the proposal.
 func RegisterRoutes(deps Deps) error {
 	if deps.Mux == nil {
 		return fmt.Errorf("opensandbox: Deps.Mux is required")
@@ -134,17 +131,17 @@ func RegisterRoutes(deps Deps) error {
 	sandboxes := RoutePrefix + "/sandboxes"
 	sandboxByID := sandboxes + "/{" + pathValueSandboxID + "}"
 
-	// Phase 1: create.
-	web.RegisterRoute(deps.Mux, http.MethodPost, sandboxes, s.CreateSandbox, auth)
+	// Create.
+	web.RegisterRouteWithErrorFormatter(deps.Mux, http.MethodPost, sandboxes, s.CreateSandbox, formatAPIError, auth)
 
-	// Phase 2: lifecycle. list is owner-scoped inside Manager.ListSandboxes, so
+	// List is owner-scoped inside Manager.ListSandboxes, so
 	// it needs no per-sandbox owner middleware; the sandbox-scoped routes load
 	// and ownership-check the target before the handler runs.
-	web.RegisterRoute(deps.Mux, http.MethodGet, sandboxes, s.ListSandboxes, auth)
-	web.RegisterRoute(deps.Mux, http.MethodGet, sandboxByID, s.DescribeSandbox, auth, s.loadOwnedSandbox(claimedSandboxStates))
-	web.RegisterRoute(deps.Mux, http.MethodDelete, sandboxByID, s.DeleteSandbox, auth, s.loadOwnedSandbox(claimedSandboxStates))
-	web.RegisterRoute(deps.Mux, http.MethodPost, sandboxByID+"/pause", s.PauseSandbox, auth, s.loadOwnedSandbox(claimedSandboxStates))
-	web.RegisterRoute(deps.Mux, http.MethodPost, sandboxByID+"/resume", s.ResumeSandbox, auth, s.loadOwnedSandbox(liveSandboxStates))
-	web.RegisterRoute(deps.Mux, http.MethodPost, sandboxByID+"/renew-expiration", s.RenewSandboxExpiration, auth, s.loadOwnedSandbox(liveSandboxStates))
+	web.RegisterRouteWithErrorFormatter(deps.Mux, http.MethodGet, sandboxes, s.ListSandboxes, formatAPIError, auth)
+	web.RegisterRouteWithErrorFormatter(deps.Mux, http.MethodGet, sandboxByID, s.DescribeSandbox, formatAPIError, auth, s.loadOwnedSandbox(claimedSandboxStates))
+	web.RegisterRouteWithErrorFormatter(deps.Mux, http.MethodDelete, sandboxByID, s.DeleteSandbox, formatAPIError, auth, s.loadOwnedSandbox(nil))
+	web.RegisterRouteWithErrorFormatter(deps.Mux, http.MethodPost, sandboxByID+"/pause", s.PauseSandbox, formatAPIError, auth, s.loadOwnedSandbox(claimedSandboxStates))
+	web.RegisterRouteWithErrorFormatter(deps.Mux, http.MethodPost, sandboxByID+"/resume", s.ResumeSandbox, formatAPIError, auth, s.loadOwnedSandbox(liveSandboxStates))
+	web.RegisterRouteWithErrorFormatter(deps.Mux, http.MethodPost, sandboxByID+"/renew-expiration", s.RenewSandboxExpiration, formatAPIError, auth, s.loadOwnedSandbox(liveSandboxStates))
 	return nil
 }

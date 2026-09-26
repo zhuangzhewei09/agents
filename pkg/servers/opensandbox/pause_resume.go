@@ -28,8 +28,8 @@ import (
 // PauseSandbox handles `POST /v1/sandboxes/{sandboxId}/pause`. The spec models
 // pause as asynchronous (202, then poll describe through Pausing → Paused);
 // agents pauses synchronously, so by the time this returns the transition is
-// already complete. 202 is still the spec-mandated status, and a client that
-// polls describe simply observes Paused on the first poll — no contract break.
+// already complete. This inherited implementation returns 202 but still blocks
+// on the backend operation; asynchronous acceptance remains a compatibility gap.
 //
 // Pause options are intentionally empty: the OpenSandbox surface carries no
 // paused-retention or auto-pause knobs, so the sandbox keeps its existing
